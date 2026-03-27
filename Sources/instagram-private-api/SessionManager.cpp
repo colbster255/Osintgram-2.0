@@ -651,22 +651,36 @@ namespace IG {
         std::string profileUrl = WEB_BASE + "/api/v1/users/web_profile_info/?username=" + username;
 
         ResponseData profileResp = MakeAuthenticatedRequest(profileUrl);
+        std::string body;
+        try { body = std::get<ByteData>(profileResp.body); } catch (...) {}
 
-        // If web_profile_info fails, try the public JSON endpoint
-        if (profileResp.statusCode < 200 || profileResp.statusCode >= 300) {
-            // Fallback: public profile JSON
+        std::cerr << "[DBG] web_profile_info: HTTP " << profileResp.statusCode
+                  << ", body length=" << body.size();
+        if (!body.empty())
+            std::cerr << ", first 200 chars: " << body.substr(0, 200);
+        std::cerr << std::endl;
+
+        // If web_profile_info fails or returns empty/non-JSON, try the public JSON endpoint
+        if (profileResp.statusCode < 200 || profileResp.statusCode >= 300 ||
+            body.empty() || body[0] != '{') {
             std::string publicUrl = WEB_BASE + "/" + username + "/?__a=1&__d=dis";
             profileResp = MakeAuthenticatedRequest(publicUrl);
+            try { body = std::get<ByteData>(profileResp.body); } catch (...) { body.clear(); }
+
+            std::cerr << "[DBG] public JSON: HTTP " << profileResp.statusCode
+                      << ", body length=" << body.size();
+            if (!body.empty())
+                std::cerr << ", first 200 chars: " << body.substr(0, 200);
+            std::cerr << std::endl;
         }
 
-        if (profileResp.statusCode < 200 || profileResp.statusCode >= 300) {
+        if (body.empty() || (profileResp.statusCode < 200 || profileResp.statusCode >= 300)) {
             std::cerr << "[!] Failed to fetch profile for '" << username
                       << "' (HTTP " << profileResp.statusCode << ")" << std::endl;
             return std::nullopt;
         }
 
         try {
-            std::string body = std::get<ByteData>(profileResp.body);
             json data = json::parse(body);
 
             // web_profile_info returns { "data": { "user": { ... } } }
