@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <chrono>
+#include <thread>
 
 // OpenSSL for password encryption
 #include <openssl/rsa.h>
@@ -112,13 +113,18 @@ namespace IG {
         req.method  = method;
 
         // Use the same header style as the login flow
-        req.headers.emplace_back("User-Agent",      _currentUser.userAgent);
-        req.headers.emplace_back("Accept",           "*/*");
-        req.headers.emplace_back("Accept-Language",  "en-US,en;q=0.9");
-        req.headers.emplace_back("X-IG-App-ID",     IG_APP_ID);
-        req.headers.emplace_back("X-Requested-With", "XMLHttpRequest");
-        req.headers.emplace_back("Referer",          "https://www.instagram.com/");
-        req.headers.emplace_back("Origin",           "https://www.instagram.com");
+        req.headers.emplace_back("User-Agent",       _currentUser.userAgent);
+        req.headers.emplace_back("Accept",            "*/*");
+        req.headers.emplace_back("Accept-Language",   "en-US,en;q=0.9");
+        req.headers.emplace_back("Accept-Encoding",   "identity");
+        req.headers.emplace_back("X-IG-App-ID",      IG_APP_ID);
+        req.headers.emplace_back("X-IG-WWW-Claim",   "0");
+        req.headers.emplace_back("X-Requested-With",  "XMLHttpRequest");
+        req.headers.emplace_back("Sec-Fetch-Site",    "same-origin");
+        req.headers.emplace_back("Sec-Fetch-Mode",    "cors");
+        req.headers.emplace_back("Sec-Fetch-Dest",    "empty");
+        req.headers.emplace_back("Referer",           "https://www.instagram.com/");
+        req.headers.emplace_back("Origin",            "https://www.instagram.com");
 
         std::string cookies = "sessionid=" + _currentUser.sessionId
                             + "; csrftoken=" + _currentUser.csrfToken
@@ -664,37 +670,121 @@ namespace IG {
     // -------------------------------------------------------------------------
     // Fetch user info  (web endpoints)
     // -------------------------------------------------------------------------
+    // Helper: extract body string from a response
+    static std::string GetResponseBody(const ResponseData& resp) {
+        try { return std::get<ByteData>(resp.body); } catch (...) { return ""; }
+    }
+
     std::optional<TargetInfo> SessionManager::FetchUserInfo(const std::string& username) {
-        // Web profile info endpoint – works with web session
-        std::string profileUrl = WEB_BASE + "/api/v1/users/web_profile_info/?username=" + username;
-
-        ResponseData profileResp = MakeAuthenticatedRequest(profileUrl);
         std::string body;
-        try { body = std::get<ByteData>(profileResp.body); } catch (...) {}
+        int status = 0;
 
-        std::cerr << "[DBG] web_profile_info: HTTP " << profileResp.statusCode
-                  << ", body length=" << body.size();
-        if (!body.empty())
-            std::cerr << ", first 200 chars: " << body.substr(0, 200);
-        std::cerr << std::endl;
+        // Attempt 1: web_profile_info endpoint (primary, what Instagram web uses)
+        {
+            std::string url = WEB_BASE + "/api/v1/users/web_profile_info/?username=" + urlEncode(username);
+            ResponseData resp = MakeAuthenticatedRequest(url);
+            status = resp.statusCode;
+            body = GetResponseBody(resp);
 
-        // If web_profile_info fails or returns empty/non-JSON, try the public JSON endpoint
-        if (profileResp.statusCode < 200 || profileResp.statusCode >= 300 ||
-            body.empty() || body[0] != '{') {
-            std::string publicUrl = WEB_BASE + "/" + username + "/?__a=1&__d=dis";
-            profileResp = MakeAuthenticatedRequest(publicUrl);
-            try { body = std::get<ByteData>(profileResp.body); } catch (...) { body.clear(); }
+            // Retry once on 429 (rate limit) after a short wait
+            if (status == 429) {
+                std::cerr << "[*] Rate limited, waiting 3 seconds..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                resp = MakeAuthenticatedRequest(url);
+                status = resp.statusCode;
+                body = GetResponseBody(resp);
+            }
 
-            std::cerr << "[DBG] public JSON: HTTP " << profileResp.statusCode
-                      << ", body length=" << body.size();
-            if (!body.empty())
-                std::cerr << ", first 200 chars: " << body.substr(0, 200);
-            std::cerr << std::endl;
+            std::cerr << "[DBG] web_profile_info: HTTP " << status
+                      << ", body=" << body.size() << "B" << std::endl;
         }
 
-        if (body.empty() || (profileResp.statusCode < 200 || profileResp.statusCode >= 300)) {
+        // Attempt 2: direct user info via API (by username -> user ID lookup)
+        if (body.empty() || body[0] != '{') {
+            std::string url = API_BASE + "/users/web_profile_info/?username=" + urlEncode(username);
+            ResponseData resp = MakeAuthenticatedRequest(url);
+            status = resp.statusCode;
+            body = GetResponseBody(resp);
+            std::cerr << "[DBG] api/web_profile_info: HTTP " << status
+                      << ", body=" << body.size() << "B" << std::endl;
+        }
+
+        // Attempt 3: scrape the profile page HTML for embedded JSON (shared_data)
+        if (body.empty() || body[0] != '{') {
+            RequestData req;
+            req.url    = WEB_BASE + "/" + username + "/";
+            req.method = RequestMethod::REQ_GET;
+            req.headers.emplace_back("User-Agent",      _currentUser.userAgent);
+            req.headers.emplace_back("Accept",           "text/html,application/xhtml+xml,*/*");
+            req.headers.emplace_back("Accept-Language",  "en-US,en;q=0.9");
+            req.headers.emplace_back("Accept-Encoding",  "identity");
+
+            std::string cookies = "sessionid=" + _currentUser.sessionId
+                                + "; csrftoken=" + _currentUser.csrfToken
+                                + "; ds_user_id=" + _currentUser.dsUserId;
+            if (!_currentUser.mid.empty()) cookies += "; mid=" + _currentUser.mid;
+            req.headers.emplace_back("Cookie", cookies);
+
+            req.connTimeoutMillis = 30000;
+            req.readTimeoutMillis = 30000;
+            req.followRedirects   = true;
+            req.verifySSL         = true;
+
+            ResponseData resp = CreateRequest(req);
+            status = resp.statusCode;
+            std::string html = GetResponseBody(resp);
+            std::cerr << "[DBG] profile HTML: HTTP " << status
+                      << ", body=" << html.size() << "B" << std::endl;
+
+            // Extract JSON from window._sharedData or window.__additionalDataLoaded
+            if (!html.empty()) {
+                // Try window._sharedData = {...};
+                std::string marker1 = "window._sharedData = ";
+                size_t pos = html.find(marker1);
+                if (pos != std::string::npos) {
+                    pos += marker1.size();
+                    size_t end = html.find(";</script>", pos);
+                    if (end != std::string::npos) {
+                        std::string jsonStr = html.substr(pos, end - pos);
+                        try {
+                            json shared = json::parse(jsonStr);
+                            if (shared.contains("entry_data") &&
+                                shared["entry_data"].contains("ProfilePage") &&
+                                !shared["entry_data"]["ProfilePage"].empty()) {
+                                auto& profilePage = shared["entry_data"]["ProfilePage"][0];
+                                if (profilePage.contains("graphql"))
+                                    body = profilePage["graphql"].dump();
+                                else
+                                    body = profilePage.dump();
+                            }
+                        } catch (...) {}
+                    }
+                }
+
+                // Try "ProfilePage":[{...}] pattern in any script tag
+                if (body.empty() || body[0] != '{') {
+                    std::string marker2 = "\"user\":{";
+                    pos = html.find(marker2);
+                    if (pos != std::string::npos) {
+                        // Find the enclosing JSON object
+                        size_t start = html.rfind('{', pos);
+                        if (start != std::string::npos) {
+                            int depth = 0;
+                            size_t end = start;
+                            for (size_t i = start; i < html.size(); i++) {
+                                if (html[i] == '{') depth++;
+                                else if (html[i] == '}') { depth--; if (depth == 0) { end = i + 1; break; } }
+                            }
+                            body = html.substr(start, end - start);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (body.empty() || body[0] != '{') {
             std::cerr << "[!] Failed to fetch profile for '" << username
-                      << "' (HTTP " << profileResp.statusCode << ")" << std::endl;
+                      << "' (HTTP " << status << ")" << std::endl;
             return std::nullopt;
         }
 
