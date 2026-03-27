@@ -140,6 +140,10 @@ namespace IG {
         bool _hasTarget = false;
         mutable std::mutex _mutex;
 
+        // Encryption keys from Instagram
+        std::string _encPubKey;
+        int _encKeyId = 0;
+
         static const std::string API_BASE;
         static const std::string WEB_BASE;
         static const std::string IG_APP_ID;

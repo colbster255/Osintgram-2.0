@@ -95,7 +95,15 @@ namespace IG {
         RequestData req;
         req.url     = url;
         req.method  = method;
-        req.headers = BuildCommonHeaders();
+
+        // Use the same header style as the login flow
+        req.headers.emplace_back("User-Agent",      _currentUser.userAgent);
+        req.headers.emplace_back("Accept",           "*/*");
+        req.headers.emplace_back("Accept-Language",  "en-US,en;q=0.9");
+        req.headers.emplace_back("X-IG-App-ID",     IG_APP_ID);
+        req.headers.emplace_back("X-Requested-With", "XMLHttpRequest");
+        req.headers.emplace_back("Referer",          "https://www.instagram.com/");
+        req.headers.emplace_back("Origin",           "https://www.instagram.com");
 
         std::string cookies = "sessionid=" + _currentUser.sessionId
                             + "; csrftoken=" + _currentUser.csrfToken
@@ -277,30 +285,49 @@ namespace IG {
     }
 
     // -------------------------------------------------------------------------
-    // Login
+    // Web login helpers
+    // -------------------------------------------------------------------------
+    static const std::string WEB_USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+    static const std::string WEB_IG_APP_ID = "936619743392459";
+
+    static Headers BuildWebHeaders() {
+        Headers h;
+        h.emplace_back("User-Agent",       WEB_USER_AGENT);
+        h.emplace_back("Accept",           "*/*");
+        h.emplace_back("Accept-Language",  "en-US,en;q=0.9");
+        h.emplace_back("X-IG-App-ID",     WEB_IG_APP_ID);
+        h.emplace_back("X-Requested-With","XMLHttpRequest");
+        h.emplace_back("Sec-Fetch-Site",   "same-origin");
+        h.emplace_back("Sec-Fetch-Mode",   "cors");
+        h.emplace_back("Sec-Fetch-Dest",   "empty");
+        h.emplace_back("Referer",          "https://www.instagram.com/accounts/login/");
+        h.emplace_back("Origin",           "https://www.instagram.com");
+        return h;
+    }
+
+    // -------------------------------------------------------------------------
+    // Login  (web flow via www.instagram.com)
     // -------------------------------------------------------------------------
     bool SessionManager::Login(const std::string& username, const std::string& password) {
         std::lock_guard<std::mutex> lock(_mutex);
 
         _currentUser         = UserSession{};
         _currentUser.username  = username;
-        _currentUser.userAgent = BuildUserAgent();
+        _currentUser.userAgent = WEB_USER_AGENT;
 
         std::string deviceId = makeDeviceId(username);
         std::string guid     = makeGuid(username);
-        std::string phoneId  = makeGuid(username + "phone");
 
         // ------------------------------------------------------------------
-        // Step 1: fetch_headers  →  get CSRF token + encryption key
+        // Step 1: GET the login page to grab the csrftoken cookie
         // ------------------------------------------------------------------
-        std::string encPubKey;
-        int         encKeyId = 0;
-
         {
             RequestData req;
-            req.url     = API_BASE + "/si/fetch_headers/?challenge_type=signup&guid=" + guid;
+            req.url     = WEB_BASE + "/accounts/login/";
             req.method  = RequestMethod::REQ_GET;
-            req.headers = BuildCommonHeaders();
+            req.headers = BuildWebHeaders();
             req.connTimeoutMillis = 15000;
             req.readTimeoutMillis = 15000;
             req.followRedirects   = true;
@@ -309,59 +336,81 @@ namespace IG {
             ResponseData resp = CreateRequest(req);
             ParseLoginCookies(resp.headers);
 
-            // Look for encryption key headers
+            // Also look for encryption keys in response headers
+            std::string encPubKeyHeader, encKeyIdHeader;
             for (const auto& [k, v] : resp.headers) {
                 std::string lk = k;
                 std::transform(lk.begin(), lk.end(), lk.begin(), ::tolower);
-                if (lk == "ig-set-password-encryption-pub-key")  encPubKey = v;
-                if (lk == "ig-set-password-encryption-key-id")   encKeyId  = std::stoi(v);
+                if (lk == "ig-set-password-encryption-pub-key")  _encPubKey = v;
+                if (lk == "ig-set-password-encryption-key-id") {
+                    try { _encKeyId = std::stoi(v); } catch (...) {}
+                }
+            }
+
+            // Try to extract csrftoken from HTML if not in cookie
+            if (_currentUser.csrfToken.empty()) {
+                std::string body;
+                try { body = std::get<ByteData>(resp.body); } catch (...) {}
+                std::regex csrfRx("\"csrf_token\"\\s*:\\s*\"([^\"]+)\"");
+                std::smatch m;
+                if (std::regex_search(body, m, csrfRx))
+                    _currentUser.csrfToken = m[1].str();
             }
         }
 
+        if (_currentUser.csrfToken.empty()) {
+            std::cerr << "[!] Failed to obtain CSRF token from Instagram." << std::endl;
+            return false;
+        }
+
         // ------------------------------------------------------------------
-        // Step 2: encrypt password
+        // Step 2: Build enc_password
         // ------------------------------------------------------------------
         std::string encPassword;
-        if (!encPubKey.empty() && encKeyId > 0) {
+        std::string timestamp = std::to_string(std::time(nullptr));
+
+        if (!_encPubKey.empty() && _encKeyId > 0) {
             try {
-                encPassword = encryptPasswordForIG(password, encPubKey, encKeyId);
+                encPassword = encryptPasswordForIG(password, _encPubKey, _encKeyId);
             } catch (const std::exception& e) {
-                std::cerr << "[!] Password encryption failed: " << e.what() << std::endl;
-                return false;
+                std::cerr << "[!] Password encryption failed (" << e.what()
+                          << "), using timestamp format." << std::endl;
+                encPassword = "#PWD_INSTAGRAM_BROWSER:0:" + timestamp + ":" + password;
             }
         } else {
-            // Fallback: send plain (Instagram will likely reject, but we surface the error)
-            std::cerr << "[!] Warning: could not retrieve Instagram encryption key. "
-                      << "Sending password without encryption." << std::endl;
-            encPassword = "#PWD_INSTAGRAM:0:0:" + password;
+            // Web browser format – unencrypted but properly tagged
+            encPassword = "#PWD_INSTAGRAM_BROWSER:0:" + timestamp + ":" + password;
         }
 
         // ------------------------------------------------------------------
-        // Step 3: POST login
+        // Step 3: POST ajax/login
         // ------------------------------------------------------------------
-        std::string csrfToken = _currentUser.csrfToken.empty() ? "missing" : _currentUser.csrfToken;
-
         std::string body =
-            "username="           + urlEncode(username)     +
-            "&enc_password="      + urlEncode(encPassword)  +
-            "&device_id="         + urlEncode(deviceId)     +
-            "&guid="              + urlEncode(guid)         +
-            "&phone_id="          + urlEncode(phoneId)      +
-            "&_csrftoken="        + urlEncode(csrfToken)    +
-            "&login_attempt_count=0"                        +
-            "&_uuid="             + urlEncode(guid);
+            "username="           + urlEncode(username)    +
+            "&enc_password="      + urlEncode(encPassword) +
+            "&queryParams=%7B%7D"                          +
+            "&optIntoOneTap=false"                         +
+            "&stopDeletionNonce="                          +
+            "&trustedDeviceRecords=%7B%7D";
 
         RequestData loginReq;
-        loginReq.url     = API_BASE + "/accounts/login/";
+        loginReq.url     = WEB_BASE + "/api/v1/web/accounts/login/ajax/";
         loginReq.method  = RequestMethod::REQ_POST;
-        loginReq.headers = BuildCommonHeaders();
-        if (!csrfToken.empty())
-            loginReq.headers.emplace_back("X-CSRFToken", csrfToken);
-        loginReq.body             = ByteData(body);
+        loginReq.headers = BuildWebHeaders();
+        loginReq.headers.emplace_back("Content-Type",
+            "application/x-www-form-urlencoded");
+        loginReq.headers.emplace_back("X-CSRFToken", _currentUser.csrfToken);
+
+        // Send cookies we already have
+        std::string cookies = "csrftoken=" + _currentUser.csrfToken;
+        if (!_currentUser.mid.empty()) cookies += "; mid=" + _currentUser.mid;
+        loginReq.headers.emplace_back("Cookie", cookies);
+
+        loginReq.body              = ByteData(body);
         loginReq.connTimeoutMillis = 30000;
         loginReq.readTimeoutMillis = 30000;
-        loginReq.followRedirects  = true;
-        loginReq.verifySSL        = true;
+        loginReq.followRedirects   = true;
+        loginReq.verifySSL         = true;
 
         ResponseData loginResp = CreateRequest(loginReq);
         ParseLoginCookies(loginResp.headers);
@@ -377,61 +426,58 @@ namespace IG {
             return false;
         }
 
-        // Try JSON parse
         json respJson;
         try {
             respJson = json::parse(rawBody);
         } catch (...) {
-            std::cerr << "[!] Instagram returned a non-JSON response (HTTP "
-                      << loginResp.statusCode << ")" << std::endl;
-            // If we somehow got cookies, treat as success
-            if (!_currentUser.sessionId.empty()) {
-                _currentUser.userId        = _currentUser.dsUserId;
-                _currentUser.authenticated = true;
-                return true;
-            }
+            std::cerr << "[!] Non-JSON response (HTTP " << loginResp.statusCode << ")." << std::endl;
             return false;
         }
 
-        // Successful login
-        if (respJson.contains("logged_in_user")) {
-            auto& u = respJson["logged_in_user"];
-            if (u.contains("pk_id"))
-                _currentUser.userId = u["pk_id"].is_string()
-                    ? u["pk_id"].get<std::string>()
-                    : std::to_string(u.value("pk_id", 0LL));
-            else
-                _currentUser.userId = std::to_string(u.value("pk", 0LL));
+        // Check authenticated (web returns {"authenticated": true, "userId": "..."})
+        if (respJson.value("authenticated", false)) {
+            _currentUser.userId        = respJson.value("userId", _currentUser.dsUserId);
             _currentUser.authenticated = true;
+            // Update CSRF token if it changed
+            ParseLoginCookies(loginResp.headers);
             return true;
         }
 
-        // 2FA required
+        // 2FA required  (web returns {"two_factor_required": true, ...})
         if (respJson.value("two_factor_required", false)) {
-            return Handle2FA(respJson, username, deviceId, guid, csrfToken);
+            return Handle2FA(respJson, username, deviceId, guid, _currentUser.csrfToken);
         }
 
         // Error messages
-        std::string errType = respJson.value("error_type", "");
         std::string msg     = respJson.value("message", "");
+        std::string errType = respJson.value("error_type", "");
+        bool showedError = false;
 
-        if (errType == "bad_password")
-            std::cerr << "[!] Incorrect password." << std::endl;
-        else if (errType == "invalid_user")
-            std::cerr << "[!] User '" << username << "' not found." << std::endl;
-        else if (errType == "checkpoint_challenge_required")
-            std::cerr << "[!] Instagram requires identity verification (challenge).\n"
-                      << "[!] Open the Instagram app and approve the login, then retry." << std::endl;
-        else if (!msg.empty())
-            std::cerr << "[!] Login failed: " << msg << std::endl;
-        else
-            std::cerr << "[!] Login failed (HTTP " << loginResp.statusCode << ")" << std::endl;
+        if (respJson.value("checkpoint_url", "") != "") {
+            std::cerr << "[!] Instagram requires a checkpoint challenge." << std::endl;
+            std::cerr << "[!] Open https://www.instagram.com" << respJson["checkpoint_url"].get<std::string>()
+                      << " in your browser to verify, then retry." << std::endl;
+            showedError = true;
+        }
+
+        if (!showedError) {
+            if (errType == "bad_password" || msg.find("password") != std::string::npos)
+                std::cerr << "[!] Incorrect password." << std::endl;
+            else if (errType == "invalid_user")
+                std::cerr << "[!] User '" << username << "' not found." << std::endl;
+            else if (!msg.empty())
+                std::cerr << "[!] Login failed: " << msg << std::endl;
+            else if (respJson.value("status", "") == "fail")
+                std::cerr << "[!] Login failed (Instagram rejected the request)." << std::endl;
+            else
+                std::cerr << "[!] Login failed (HTTP " << loginResp.statusCode << ")." << std::endl;
+        }
 
         return false;
     }
 
     // -------------------------------------------------------------------------
-    // 2FA handler
+    // 2FA handler  (works with both web and mobile API responses)
     // -------------------------------------------------------------------------
     bool SessionManager::Handle2FA(const json& initialResp,
                                    const std::string& username,
@@ -439,32 +485,27 @@ namespace IG {
                                    const std::string& guid,
                                    const std::string& csrfToken) {
         std::string identifier;
-        std::string twoFactorMethod;
+        int verificationMethod = 1; // default SMS
 
         if (initialResp.contains("two_factor_info")) {
             const auto& info = initialResp["two_factor_info"];
             identifier       = info.value("two_factor_identifier", "");
-            // 1 = SMS, 3 = TOTP app
-            int method = info.value("totp_two_factor_on", false) ? 3 : 1;
-            twoFactorMethod  = std::to_string(method);
+            if (info.value("totp_two_factor_on", false))
+                verificationMethod = 3;  // TOTP (authenticator app)
         }
 
         std::cout << std::endl;
         std::cout << "[*] Two-factor authentication required." << std::endl;
-
-        bool isTOTP = (twoFactorMethod == "3");
-        if (isTOTP)
-            std::cout << "[*] Method: Authenticator app (TOTP)" << std::endl;
-        else
-            std::cout << "[*] Method: SMS" << std::endl;
-
+        std::cout << "[*] Method: "
+                  << (verificationMethod == 3 ? "Authenticator app (TOTP)" : "SMS")
+                  << std::endl;
         std::cout << "[*] Enter your 2FA code: ";
         std::cout.flush();
 
         std::string code;
         std::getline(std::cin, code);
 
-        // Strip spaces/dashes from code
+        // Strip spaces/dashes
         code.erase(std::remove_if(code.begin(), code.end(),
                    [](char c){ return c == ' ' || c == '-'; }), code.end());
 
@@ -473,60 +514,74 @@ namespace IG {
             return false;
         }
 
-        // POST two_factor_login
-        std::string body =
-            "username="               + urlEncode(username)         +
-            "&verificationCode="      + urlEncode(code)             +
-            "&two_factor_identifier=" + urlEncode(identifier)       +
-            "&_csrftoken="            + urlEncode(csrfToken)        +
-            "&trust_this_device=0"                                   +
-            "&guid="                  + urlEncode(guid)             +
-            "&device_id="             + urlEncode(deviceId)         +
-            "&verification_method="   + urlEncode(twoFactorMethod);
-
-        RequestData req;
-        req.url     = API_BASE + "/accounts/two_factor_login/";
-        req.method  = RequestMethod::REQ_POST;
-        req.headers = BuildCommonHeaders();
-        req.headers.emplace_back("X-CSRFToken", csrfToken);
-        req.body              = ByteData(body);
-        req.connTimeoutMillis = 30000;
-        req.readTimeoutMillis = 30000;
-        req.followRedirects   = true;
-        req.verifySSL         = true;
-
-        // Add cookies we have so far
-        std::string cookies = "csrftoken=" + _currentUser.csrfToken;
+        // Build cookies string
+        std::string cookies = "csrftoken=" + csrfToken;
         if (!_currentUser.mid.empty()) cookies += "; mid=" + _currentUser.mid;
-        req.headers.emplace_back("Cookie", cookies);
 
-        ResponseData resp = CreateRequest(req);
-        ParseLoginCookies(resp.headers);
+        // Try web 2FA endpoint first
+        {
+            std::string body =
+                "username="               + urlEncode(username)                        +
+                "&verificationCode="      + urlEncode(code)                            +
+                "&identifier="            + urlEncode(identifier)                      +
+                "&queryParams=%7B%22next%22%3A%22%2F%22%7D"                            +
+                "&trust_this_device=1"                                                 +
+                "&verification_method="   + std::to_string(verificationMethod);
 
-        std::string rawBody;
-        try { rawBody = std::get<ByteData>(resp.body); } catch (...) {}
+            RequestData req;
+            req.url     = WEB_BASE + "/api/v1/web/accounts/login/ajax/two_factor/";
+            req.method  = RequestMethod::REQ_POST;
+            req.headers = BuildWebHeaders();
+            req.headers.emplace_back("Content-Type",
+                "application/x-www-form-urlencoded");
+            req.headers.emplace_back("X-CSRFToken", csrfToken);
+            req.headers.emplace_back("Cookie", cookies);
+            req.body              = ByteData(body);
+            req.connTimeoutMillis = 30000;
+            req.readTimeoutMillis = 30000;
+            req.followRedirects   = true;
+            req.verifySSL         = true;
 
-        json respJson;
-        try { respJson = json::parse(rawBody); } catch (...) {
-            std::cerr << "[!] Non-JSON response from 2FA endpoint." << std::endl;
+            ResponseData resp = CreateRequest(req);
+            ParseLoginCookies(resp.headers);
+
+            std::string rawBody;
+            try { rawBody = std::get<ByteData>(resp.body); } catch (...) {}
+
+            json respJson;
+            try { respJson = json::parse(rawBody); } catch (...) {
+                std::cerr << "[!] Non-JSON response from 2FA endpoint." << std::endl;
+                return false;
+            }
+
+            // Web returns {"authenticated": true, "userId": "..."}
+            if (respJson.value("authenticated", false)) {
+                _currentUser.userId        = respJson.value("userId", _currentUser.dsUserId);
+                _currentUser.authenticated = true;
+                std::cout << "[+] 2FA verified successfully." << std::endl;
+                return true;
+            }
+
+            // Mobile API format
+            if (respJson.contains("logged_in_user")) {
+                auto& u = respJson["logged_in_user"];
+                _currentUser.userId = std::to_string(u.value("pk", 0LL));
+                _currentUser.authenticated = true;
+                std::cout << "[+] 2FA verified successfully." << std::endl;
+                return true;
+            }
+
+            std::string errMsg = respJson.value("message", "");
+            if (errMsg.find("check the code") != std::string::npos ||
+                errMsg.find("invalid") != std::string::npos)
+                std::cerr << "[!] Invalid 2FA code. Please try again." << std::endl;
+            else if (!errMsg.empty())
+                std::cerr << "[!] 2FA failed: " << errMsg << std::endl;
+            else
+                std::cerr << "[!] 2FA verification failed." << std::endl;
+
             return false;
         }
-
-        if (respJson.contains("logged_in_user")) {
-            auto& u = respJson["logged_in_user"];
-            _currentUser.userId = std::to_string(u.value("pk", 0LL));
-            _currentUser.authenticated = true;
-            std::cout << "[+] 2FA verified successfully." << std::endl;
-            return true;
-        }
-
-        std::string errType = respJson.value("error_type", "");
-        if (errType == "two_factor_required")
-            std::cerr << "[!] Invalid or expired 2FA code." << std::endl;
-        else
-            std::cerr << "[!] 2FA failed: " << respJson.value("message", "unknown error") << std::endl;
-
-        return false;
     }
 
     // -------------------------------------------------------------------------
