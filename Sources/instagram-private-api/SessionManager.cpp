@@ -203,9 +203,9 @@ namespace IG {
 
             json respJson = json::parse(respBody);
 
-            if (respJson.contains("logged_in_user")) {
-                auto& user = respJson["logged_in_user"];
-                _currentUser.userId = std::to_string(user.value("pk", 0L));
+            if (respJson.contains("logged_in_user") || respJson.contains("user")) {
+                auto& user = respJson.contains("logged_in_user") ? respJson["logged_in_user"] : respJson["user"];
+                _currentUser.userId = std::to_string(user.value("pk", user.value("id", 0L)));
                 _currentUser.authenticated = true;
 
                 // Build auth headers for future requests
@@ -218,6 +218,12 @@ namespace IG {
                 return true;
             }
 
+            if (respJson.value("status", "") == "ok" && !_currentUser.sessionId.empty() && !_currentUser.dsUserId.empty()) {
+                _currentUser.userId = _currentUser.dsUserId;
+                _currentUser.authenticated = true;
+                return true;
+            }
+
             if (respJson.contains("two_factor_required") && respJson["two_factor_required"].get<bool>()) {
                 std::cerr << "[!] Two-factor authentication required." << std::endl;
                 std::cerr << "[!] 2FA support is not yet fully implemented." << std::endl;
@@ -226,7 +232,15 @@ namespace IG {
             }
 
             if (respJson.contains("message")) {
-                std::cerr << "[!] Login failed: " << respJson["message"].get<std::string>() << std::endl;
+                std::string message = respJson["message"].get<std::string>();
+                if (message.empty()) {
+                    std::string status = respJson.value("status", "unknown");
+                    std::cerr << "[!] Login failed: no message returned (status=" << status << ")" << std::endl;
+                } else {
+                    std::cerr << "[!] Login failed: " << message << std::endl;
+                }
+            } else if (respJson.contains("status")) {
+                std::cerr << "[!] Login failed: status=" << respJson["status"].get<std::string>() << std::endl;
             }
 
             if (respJson.contains("error_type")) {
@@ -239,6 +253,10 @@ namespace IG {
                     std::cerr << "[!] Challenge required. Instagram needs identity verification." << std::endl;
                     std::cerr << "[!] Please log in via the Instagram app first to clear the challenge." << std::endl;
                 }
+            }
+
+            if (respJson.contains("challenge")) {
+                std::cerr << "[!] Challenge data received. Complete verification in Instagram app/web and retry." << std::endl;
             }
 
         } catch (const json::exception& e) {
