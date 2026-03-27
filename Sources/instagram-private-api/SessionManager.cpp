@@ -736,47 +736,142 @@ namespace IG {
             std::cerr << "[DBG] profile HTML: HTTP " << status
                       << ", body=" << html.size() << "B" << std::endl;
 
-            // Extract JSON from window._sharedData or window.__additionalDataLoaded
+            // Extract user data from Instagram's embedded JSON in the HTML
             if (!html.empty()) {
-                // Try window._sharedData = {...};
-                std::string marker1 = "window._sharedData = ";
-                size_t pos = html.find(marker1);
-                if (pos != std::string::npos) {
-                    pos += marker1.size();
-                    size_t end = html.find(";</script>", pos);
-                    if (end != std::string::npos) {
-                        std::string jsonStr = html.substr(pos, end - pos);
-                        try {
-                            json shared = json::parse(jsonStr);
-                            if (shared.contains("entry_data") &&
-                                shared["entry_data"].contains("ProfilePage") &&
-                                !shared["entry_data"]["ProfilePage"].empty()) {
-                                auto& profilePage = shared["entry_data"]["ProfilePage"][0];
-                                if (profilePage.contains("graphql"))
-                                    body = profilePage["graphql"].dump();
-                                else
-                                    body = profilePage.dump();
+                // Modern Instagram embeds data in various script tags. Search for known patterns.
+
+                // Pattern 1: window._sharedData = {...};
+                auto tryExtract = [&](const std::string& marker, const std::string& endMarker) -> bool {
+                    size_t pos = html.find(marker);
+                    if (pos == std::string::npos) return false;
+                    pos += marker.size();
+                    size_t end = html.find(endMarker, pos);
+                    if (end == std::string::npos) return false;
+                    try {
+                        json j = json::parse(html.substr(pos, end - pos));
+                        if (j.contains("entry_data") && j["entry_data"].contains("ProfilePage") &&
+                            !j["entry_data"]["ProfilePage"].empty()) {
+                            body = j["entry_data"]["ProfilePage"][0].dump();
+                            return true;
+                        }
+                    } catch (...) {}
+                    return false;
+                };
+
+                tryExtract("window._sharedData = ", ";</script>");
+                if (body.empty() || body[0] != '{')
+                    tryExtract("window.__additionalDataLoaded(", ");</script>");
+
+                // Pattern 2: look for JSON blob containing "biography" (unique to user profile data)
+                if (body.empty() || body[0] != '{') {
+                    // Search for the username in a JSON context with profile fields
+                    std::string searchKey = "\"biography\"";
+                    size_t pos = 0;
+                    while (pos < html.size() && (body.empty() || body[0] != '{')) {
+                        pos = html.find(searchKey, pos);
+                        if (pos == std::string::npos) break;
+
+                        // Walk backwards to find the opening brace of the object containing "biography"
+                        // We need to find a '{' that also has "username" nearby
+                        size_t searchStart = (pos > 2000) ? pos - 2000 : 0;
+                        size_t bracePos = html.rfind('{', pos);
+
+                        // Try progressively larger enclosing objects
+                        for (int attempt = 0; attempt < 10 && bracePos > searchStart; attempt++) {
+                            int depth = 0;
+                            size_t end = bracePos;
+                            bool valid = true;
+                            for (size_t i = bracePos; i < html.size() && i < bracePos + 50000; i++) {
+                                if (html[i] == '{') depth++;
+                                else if (html[i] == '}') {
+                                    depth--;
+                                    if (depth == 0) { end = i + 1; break; }
+                                }
                             }
-                        } catch (...) {}
+                            if (depth != 0) { valid = false; }
+
+                            if (valid && end > bracePos) {
+                                std::string candidate = html.substr(bracePos, end - bracePos);
+                                // Must contain key profile fields
+                                if (candidate.find("\"username\"") != std::string::npos &&
+                                    candidate.find("\"full_name\"") != std::string::npos &&
+                                    candidate.find(username) != std::string::npos) {
+                                    try {
+                                        json test = json::parse(candidate);
+                                        // Found valid JSON with profile data
+                                        body = candidate;
+                                        break;
+                                    } catch (...) {}
+                                }
+                            }
+                            // Try the next outer brace
+                            if (bracePos == 0) break;
+                            bracePos = html.rfind('{', bracePos - 1);
+                        }
+                        pos += searchKey.size();
                     }
                 }
 
-                // Try "ProfilePage":[{...}] pattern in any script tag
+                // Pattern 3: search all <script> tags for JSON containing the target username + profile fields
                 if (body.empty() || body[0] != '{') {
-                    std::string marker2 = "\"user\":{";
-                    pos = html.find(marker2);
-                    if (pos != std::string::npos) {
-                        // Find the enclosing JSON object
-                        size_t start = html.rfind('{', pos);
-                        if (start != std::string::npos) {
-                            int depth = 0;
-                            size_t end = start;
-                            for (size_t i = start; i < html.size(); i++) {
-                                if (html[i] == '{') depth++;
-                                else if (html[i] == '}') { depth--; if (depth == 0) { end = i + 1; break; } }
-                            }
-                            body = html.substr(start, end - start);
+                    std::string scriptStart = "<script type=\"application/json\"";
+                    size_t pos = 0;
+                    while ((pos = html.find(scriptStart, pos)) != std::string::npos) {
+                        size_t contentStart = html.find('>', pos);
+                        if (contentStart == std::string::npos) break;
+                        contentStart++;
+                        size_t contentEnd = html.find("</script>", contentStart);
+                        if (contentEnd == std::string::npos) break;
+
+                        std::string scriptContent = html.substr(contentStart, contentEnd - contentStart);
+                        if (scriptContent.find(username) != std::string::npos &&
+                            scriptContent.find("biography") != std::string::npos) {
+                            try {
+                                json scriptJson = json::parse(scriptContent);
+                                // Recursively search for user object
+                                std::function<json(const json&)> findUser = [&](const json& j) -> json {
+                                    if (j.is_object()) {
+                                        if (j.contains("username") && j.contains("biography") &&
+                                            j.value("username", "") == username)
+                                            return j;
+                                        for (auto& [k, v] : j.items()) {
+                                            json result = findUser(v);
+                                            if (!result.is_null()) return result;
+                                        }
+                                    } else if (j.is_array()) {
+                                        for (auto& elem : j) {
+                                            json result = findUser(elem);
+                                            if (!result.is_null()) return result;
+                                        }
+                                    }
+                                    return json();
+                                };
+                                json userObj = findUser(scriptJson);
+                                if (!userObj.is_null()) {
+                                    body = "{\"user\":" + userObj.dump() + "}";
+                                    break;
+                                }
+                            } catch (...) {}
                         }
+                        pos = contentEnd;
+                    }
+                }
+
+                // Debug: if still no data, show what script data-content-len we see
+                if (body.empty() || body[0] != '{') {
+                    std::cerr << "[DBG] HTML markers found:" << std::endl;
+                    std::cerr << "  _sharedData: " << (html.find("_sharedData") != std::string::npos ? "yes" : "no") << std::endl;
+                    std::cerr << "  biography: " << (html.find("biography") != std::string::npos ? "yes" : "no") << std::endl;
+                    std::cerr << "  full_name: " << (html.find("full_name") != std::string::npos ? "yes" : "no") << std::endl;
+                    std::cerr << "  " << username << ": " << (html.find(username) != std::string::npos ? "yes" : "no") << std::endl;
+                    std::cerr << "  application/json: " << (html.find("application/json") != std::string::npos ? "yes" : "no") << std::endl;
+
+                    // Show nearby context around the username if found
+                    size_t upos = html.find(username);
+                    if (upos != std::string::npos) {
+                        size_t ctxStart = (upos > 100) ? upos - 100 : 0;
+                        size_t ctxLen = std::min<size_t>(300, html.size() - ctxStart);
+                        std::cerr << "  context: ..." << html.substr(ctxStart, ctxLen) << "..." << std::endl;
                     }
                 }
             }
