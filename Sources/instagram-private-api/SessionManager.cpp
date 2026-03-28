@@ -22,6 +22,11 @@
 
 namespace IG {
 
+    // Forward-declared helper (used in Login, LoadSession, FetchUserInfo, etc.)
+    static std::string GetResponseBody(const ResponseData& resp) {
+        try { return std::get<ByteData>(resp.body); } catch (...) { return ""; }
+    }
+
     const std::string SessionManager::API_BASE = "https://www.instagram.com/api/v1";
     const std::string SessionManager::WEB_BASE  = "https://www.instagram.com";
     const std::string SessionManager::IG_APP_ID = "936619743392459";
@@ -690,11 +695,6 @@ namespace IG {
         _currentUser  = UserSession{};
         _currentTarget = TargetInfo{};
         _hasTarget    = false;
-    }
-
-    // Helper: extract body string from a response
-    static std::string GetResponseBody(const ResponseData& resp) {
-        try { return std::get<ByteData>(resp.body); } catch (...) { return ""; }
     }
 
     // -------------------------------------------------------------------------
