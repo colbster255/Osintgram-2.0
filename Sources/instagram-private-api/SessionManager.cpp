@@ -762,24 +762,18 @@ namespace IG {
             _currentUser.userAgent = sess.value("userAgent", WEB_USER_AGENT);
             _currentUser.authenticated = true;
 
-            // Verify the session is still valid with a quick API call
+            // Quick check if session is still valid — but don't invalidate on rate limits
             ResponseData resp = MakeAuthenticatedRequest(API_BASE + "/accounts/current_user/?edit=true");
-            std::string body = GetResponseBody(resp);
-            if (resp.statusCode >= 200 && resp.statusCode < 300 && !body.empty()) {
-                try {
-                    json check = json::parse(body);
-                    if (check.contains("user")) {
-                        std::cerr << "[+] Resumed saved session for '" << username << "'" << std::endl;
-                        return true;
-                    }
-                } catch (...) {}
+            if (resp.statusCode == 401 || resp.statusCode == 403) {
+                // Definitively unauthorized — session is dead
+                _currentUser = UserSession{};
+                fs::remove(path);
+                std::cerr << "[*] Saved session expired (HTTP " << resp.statusCode << "), need fresh login." << std::endl;
+                return false;
             }
 
-            // Session invalid, clear it
-            _currentUser = UserSession{};
-            fs::remove(path);
-            std::cerr << "[*] Saved session invalid, need fresh login." << std::endl;
-            return false;
+            // For any other status (200, 429, etc.), trust the saved session
+            return true;
         } catch (...) {
             return false;
         }
