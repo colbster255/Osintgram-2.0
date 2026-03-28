@@ -6,6 +6,7 @@
 #include <map>
 #include <set>
 #include <algorithm>
+#include <climits>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -96,12 +97,13 @@ static int cmd_followers(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxCount = 50;
+    int maxCount = 0; // 0 = fetch all
     if (!args.empty()) {
         try { maxCount = std::stoi(args[0]); } catch (...) {}
     }
 
-    std::cout << "[*] Fetching followers for @" << target.username << " (max " << maxCount << ")..." << std::endl;
+    std::cout << "[*] Fetching all followers for @" << target.username
+              << (maxCount > 0 ? " (limit " + std::to_string(maxCount) + ")" : "") << "..." << std::endl;
 
     auto followers = mgr.FetchFollowers(target.userId, maxCount);
 
@@ -137,12 +139,13 @@ static int cmd_followings(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxCount = 50;
+    int maxCount = 0; // 0 = fetch all
     if (!args.empty()) {
         try { maxCount = std::stoi(args[0]); } catch (...) {}
     }
 
-    std::cout << "[*] Fetching following for @" << target.username << " (max " << maxCount << ")..." << std::endl;
+    std::cout << "[*] Fetching all following for @" << target.username
+              << (maxCount > 0 ? " (limit " + std::to_string(maxCount) + ")" : "") << "..." << std::endl;
 
     auto following = mgr.FetchFollowing(target.userId, maxCount);
 
@@ -178,12 +181,12 @@ static int cmd_likes(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPosts = 20;
+    int maxPosts = 0;
     if (!args.empty()) {
         try { maxPosts = std::stoi(args[0]); } catch (...) {}
     }
 
-    std::cout << "[*] Fetching like counts for @" << target.username << " (last " << maxPosts << " posts)..." << std::endl;
+    std::cout << "[*] Fetching like counts for @" << target.username << "..." << std::endl;
 
     auto feed = mgr.FetchUserFeed(target.userId, maxPosts);
 
@@ -227,12 +230,12 @@ static int cmd_comments(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPosts = 20;
+    int maxPosts = 0;
     if (!args.empty()) {
         try { maxPosts = std::stoi(args[0]); } catch (...) {}
     }
 
-    std::cout << "[*] Fetching comment counts for @" << target.username << " (last " << maxPosts << " posts)..." << std::endl;
+    std::cout << "[*] Fetching comment counts for @" << target.username << "..." << std::endl;
 
     auto feed = mgr.FetchUserFeed(target.userId, maxPosts);
 
@@ -275,7 +278,7 @@ static int cmd_hashtags(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPosts = 30;
+    int maxPosts = 0;
     if (!args.empty()) {
         try { maxPosts = std::stoi(args[0]); } catch (...) {}
     }
@@ -320,7 +323,7 @@ static int cmd_captions(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPosts = 10;
+    int maxPosts = 0;
     if (!args.empty()) {
         try { maxPosts = std::stoi(args[0]); } catch (...) {}
     }
@@ -361,7 +364,7 @@ static int cmd_mediatype(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPosts = 50;
+    int maxPosts = 0;
     if (!args.empty()) {
         try { maxPosts = std::stoi(args[0]); } catch (...) {}
     }
@@ -395,7 +398,7 @@ static int cmd_photodesc(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPosts = 10;
+    int maxPosts = 0;
     if (!args.empty()) {
         try { maxPosts = std::stoi(args[0]); } catch (...) {}
     }
@@ -448,7 +451,7 @@ static int cmd_addrs(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPosts = 50;
+    int maxPosts = 0;
     if (!args.empty()) {
         try { maxPosts = std::stoi(args[0]); } catch (...) {}
     }
@@ -520,7 +523,7 @@ static int cmd_ucomments(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPosts = 20;
+    int maxPosts = 0;
     if (!args.empty()) {
         try { maxPosts = std::stoi(args[0]); } catch (...) {}
     }
@@ -537,7 +540,7 @@ static int cmd_ucomments(const std::vector<std::string>& args) {
     for (const auto& item : feed) {
         if (item.commentCount == 0) continue;
 
-        auto comments = mgr.FetchMediaComments(item.mediaId, 50);
+        auto comments = mgr.FetchMediaComments(item.mediaId);
         for (const auto& c : comments) {
             commenterCount[c.username]++;
             if (c.username == target.username) {
@@ -578,7 +581,7 @@ static int cmd_ucomments(const std::vector<std::string>& args) {
 
         if (item.commentCount == 0) continue;
 
-        auto comments = mgr.FetchMediaComments(item.mediaId, 50);
+        auto comments = mgr.FetchMediaComments(item.mediaId);
         for (const auto& c : comments) {
             if (c.username == target.username) {
                 targetTaggedComments.emplace_back(owner, c.text, c.createdAt);
@@ -619,7 +622,7 @@ static int cmd_utagged(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPosts = 30;
+    int maxPosts = 0;
     if (!args.empty()) {
         try { maxPosts = std::stoi(args[0]); } catch (...) {}
     }
@@ -677,12 +680,12 @@ static int cmd_photos(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPhotos = 5;
+    int maxPhotos = 0; // 0 = fetch all
     if (!args.empty()) {
         try { maxPhotos = std::stoi(args[0]); } catch (...) {}
     }
 
-    std::cout << "[*] Fetching photo URLs from @" << target.username << " (max " << maxPhotos << ")..." << std::endl;
+    std::cout << "[*] Fetching photo URLs from @" << target.username << "..." << std::endl;
 
     auto feed = mgr.FetchUserFeed(target.userId, maxPhotos);
 
@@ -789,7 +792,7 @@ static int cmd_likers(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPosts = 5;
+    int maxPosts = 0;
     if (!args.empty()) {
         try { maxPosts = std::stoi(args[0]); } catch (...) {}
     }
@@ -812,7 +815,7 @@ static int cmd_likers(const std::vector<std::string>& args) {
 
         std::cout << std::endl << "--- Post " << (i + 1) << " (" << item.likeCount << " likes) ---" << std::endl;
 
-        auto likers = mgr.FetchMediaLikers(item.mediaId, 50);
+        auto likers = mgr.FetchMediaLikers(item.mediaId);
 
         for (const auto& liker : likers) {
             std::cout << "  @" << liker.username;
@@ -830,11 +833,8 @@ static int cmd_likers(const std::vector<std::string>& args) {
                   [](const auto& a, const auto& b) { return a.second > b.second; });
 
         std::cout << std::endl << "[+] Most frequent likers:" << std::endl;
-        int shown = 0;
         for (const auto& [user, count] : sorted) {
-            if (shown >= 20) break;
             std::cout << "  @" << user << " (liked " << count << " of " << feed.size() << " posts)" << std::endl;
-            shown++;
         }
     }
 
@@ -851,7 +851,7 @@ static int cmd_postcomments(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPosts = 5;
+    int maxPosts = 0;
     if (!args.empty()) {
         try { maxPosts = std::stoi(args[0]); } catch (...) {}
     }
@@ -880,7 +880,7 @@ static int cmd_postcomments(const std::vector<std::string>& args) {
             continue;
         }
 
-        auto comments = mgr.FetchMediaComments(item.mediaId, 30);
+        auto comments = mgr.FetchMediaComments(item.mediaId);
 
         for (const auto& c : comments) {
             std::cout << std::endl;
@@ -904,12 +904,10 @@ static int cmd_mutual(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxCount = 100;
-
     std::cout << "[*] Finding mutual connections for @" << target.username << "..." << std::endl;
 
-    auto followers = mgr.FetchFollowers(target.userId, maxCount);
-    auto following = mgr.FetchFollowing(target.userId, maxCount);
+    auto followers = mgr.FetchFollowers(target.userId);
+    auto following = mgr.FetchFollowing(target.userId);
 
     // Find mutual (both following and followed by)
     std::set<std::string> followerSet;
@@ -951,7 +949,7 @@ static int cmd_mutual(const std::vector<std::string>& args) {
         }
     }
 
-    if (!notFollowingBack.empty() && notFollowingBack.size() <= 30) {
+    if (!notFollowingBack.empty()) {
         std::cout << "[+] Followers NOT followed back (" << notFollowingBack.size() << "):" << std::endl;
         for (const auto& u : notFollowingBack) {
             std::cout << "  @" << u << std::endl;

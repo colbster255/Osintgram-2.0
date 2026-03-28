@@ -10,6 +10,7 @@
 #include <thread>
 #include <fstream>
 #include <filesystem>
+#include <climits>
 
 // OpenSSL for password encryption
 #include <openssl/rsa.h>
@@ -1096,6 +1097,7 @@ namespace IG {
     }
 
     std::vector<UserEntry> SessionManager::FetchFollowers(const std::string& userId, int maxCount) {
+        if (maxCount <= 0) maxCount = INT_MAX;
         std::vector<UserEntry> results;
         std::string nextMaxId;
         int fetched = 0;
@@ -1137,6 +1139,7 @@ namespace IG {
     }
 
     std::vector<UserEntry> SessionManager::FetchFollowing(const std::string& userId, int maxCount) {
+        if (maxCount <= 0) maxCount = INT_MAX;
         std::vector<UserEntry> results;
         std::string nextMaxId;
         int fetched = 0;
@@ -1181,6 +1184,7 @@ namespace IG {
     // Feed
     // -------------------------------------------------------------------------
     std::vector<MediaItem> SessionManager::FetchUserFeed(const std::string& userId, int maxCount) {
+        if (maxCount <= 0) maxCount = INT_MAX;
         std::vector<MediaItem> items;
         std::string nextMaxId;
         int fetched = 0;
@@ -1253,6 +1257,7 @@ namespace IG {
     // Comments / Likers / Stories / Tags / Search
     // -------------------------------------------------------------------------
     std::vector<CommentInfo> SessionManager::FetchMediaComments(const std::string& mediaId, int maxCount) {
+        if (maxCount <= 0) maxCount = INT_MAX;
         std::vector<CommentInfo> results;
         std::string minId;
         int fetched = 0;
@@ -1297,6 +1302,7 @@ namespace IG {
     }
 
     std::vector<UserEntry> SessionManager::FetchMediaLikers(const std::string& mediaId, int maxCount) {
+        if (maxCount <= 0) maxCount = INT_MAX;
         std::vector<UserEntry> results;
         ResponseData resp = MakeAuthenticatedRequest(API_BASE + "/media/" + mediaId + "/likers/");
         std::string body = GetResponseBody(resp);
@@ -1400,6 +1406,7 @@ namespace IG {
     }
 
     std::vector<MediaItem> SessionManager::FetchUsertagsFeed(const std::string& userId, int maxCount) {
+        if (maxCount <= 0) maxCount = INT_MAX;
         std::vector<MediaItem> items;
         std::string nextMaxId;
         int fetched = 0;

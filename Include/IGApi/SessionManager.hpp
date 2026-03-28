@@ -105,15 +105,15 @@ namespace IG {
 
         // Instagram API methods
         std::optional<TargetInfo> FetchUserInfo(const std::string& username);
-        std::vector<UserEntry> FetchFollowers(const std::string& userId, int maxCount = 50);
-        std::vector<UserEntry> FetchFollowing(const std::string& userId, int maxCount = 50);
-        std::vector<MediaItem> FetchUserFeed(const std::string& userId, int maxCount = 20);
-        std::vector<CommentInfo> FetchMediaComments(const std::string& mediaId, int maxCount = 50);
-        std::vector<UserEntry> FetchMediaLikers(const std::string& mediaId, int maxCount = 50);
+        std::vector<UserEntry> FetchFollowers(const std::string& userId, int maxCount = 0);
+        std::vector<UserEntry> FetchFollowing(const std::string& userId, int maxCount = 0);
+        std::vector<MediaItem> FetchUserFeed(const std::string& userId, int maxCount = 0);
+        std::vector<CommentInfo> FetchMediaComments(const std::string& mediaId, int maxCount = 0);
+        std::vector<UserEntry> FetchMediaLikers(const std::string& mediaId, int maxCount = 0);
         std::optional<std::string> FetchProfilePicHD(const std::string& userId);
         std::vector<MediaItem> FetchStories(const std::string& userId);
         std::vector<UserEntry> FetchTaggedUsers(const std::string& userId);
-        std::vector<MediaItem> FetchUsertagsFeed(const std::string& userId, int maxCount = 50);
+        std::vector<MediaItem> FetchUsertagsFeed(const std::string& userId, int maxCount = 0);
         std::vector<UserEntry> SearchUsers(const std::string& query, int maxCount = 10);
 
         ~SessionManager();
