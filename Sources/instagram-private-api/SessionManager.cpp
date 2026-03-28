@@ -733,6 +733,8 @@ namespace IG {
         }
 
         // Attempt 3: GraphQL query_hash with full variables
+        // This returns limited data (reel info + user ID) but we can use the ID for a full lookup
+        std::string discoveredUserId;
         if (body.empty()) {
             std::string variables = urlEncode(
                 "{\"username\":\"" + username + "\","
@@ -745,49 +747,71 @@ namespace IG {
             std::string gqlResp = GetResponseBody(resp);
 
             std::cerr << "[DBG] graphql: HTTP " << status
-                      << ", body=" << gqlResp.size() << "B"
-                      << ", content: " << gqlResp.substr(0, 400) << std::endl;
+                      << ", body=" << gqlResp.size() << "B" << std::endl;
 
             if (!gqlResp.empty() && gqlResp[0] == '{') {
                 try {
                     json gql = json::parse(gqlResp);
-                    // Check for non-empty user object
+                    // Extract user ID from reel data: data.user.reel.user.id or data.user.id
                     if (gql.contains("data") && gql["data"].contains("user") &&
-                        gql["data"]["user"].is_object() && !gql["data"]["user"].empty()) {
-                        body = gql.dump();
+                        gql["data"]["user"].is_object()) {
+                        auto& usr = gql["data"]["user"];
+                        // Try direct id field
+                        if (usr.contains("id")) {
+                            discoveredUserId = usr["id"].is_string()
+                                ? usr["id"].get<std::string>()
+                                : std::to_string(usr.value("id", 0LL));
+                        }
+                        // Try nested reel.user.id
+                        if (discoveredUserId.empty() || discoveredUserId == "0") {
+                            if (usr.contains("reel") && usr["reel"].contains("user") &&
+                                usr["reel"]["user"].contains("id")) {
+                                auto& reelUser = usr["reel"]["user"];
+                                discoveredUserId = reelUser["id"].is_string()
+                                    ? reelUser["id"].get<std::string>()
+                                    : std::to_string(reelUser.value("id", 0LL));
+                            }
+                        }
+                        // Try reel.id directly (it's the user ID)
+                        if (discoveredUserId.empty() || discoveredUserId == "0") {
+                            if (usr.contains("reel") && usr["reel"].contains("id")) {
+                                discoveredUserId = usr["reel"]["id"].is_string()
+                                    ? usr["reel"]["id"].get<std::string>()
+                                    : std::to_string(usr["reel"].value("id", 0LL));
+                            }
+                        }
+
+                        // If the user object has full profile data, use it
+                        if (usr.contains("username") && usr.contains("biography")) {
+                            body = gql.dump();
+                        }
                     }
                 } catch (...) {}
             }
+
+            if (!discoveredUserId.empty() && discoveredUserId != "0") {
+                std::cerr << "[+] Discovered user ID: " << discoveredUserId << std::endl;
+            }
         }
 
-        // Attempt 4: GraphQL POST with different doc_ids
-        if (body.empty()) {
-            std::vector<std::pair<std::string, std::string>> queries = {
-                {"9310670392322965", "{\"username\":\"" + username + "\",\"render_surface\":\"PROFILE\"}"},
-                {"17888483320059182", "{\"username\":\"" + username + "\"}"},
-            };
+        // Attempt 4: Use discovered user ID to get full profile via /users/{id}/info/
+        if (body.empty() && !discoveredUserId.empty() && discoveredUserId != "0") {
+            std::string url = API_BASE + "/users/" + discoveredUserId + "/info/";
+            ResponseData resp = MakeAuthenticatedRequest(url);
+            status = resp.statusCode;
+            std::string infoResp = GetResponseBody(resp);
 
-            for (const auto& [docId, vars] : queries) {
-                std::string graphqlBody = "variables=" + urlEncode(vars) + "&doc_id=" + docId;
-                ResponseData resp = MakeAuthenticatedRequest(
-                    WEB_BASE + "/graphql/query/",
-                    RequestMethod::REQ_POST,
-                    graphqlBody);
-                status = resp.statusCode;
-                std::string gqlResp = GetResponseBody(resp);
+            std::cerr << "[DBG] users/info: HTTP " << status
+                      << ", body=" << infoResp.size() << "B" << std::endl;
 
-                if (!gqlResp.empty() && gqlResp[0] == '{') {
-                    try {
-                        json gql = json::parse(gqlResp);
-                        if (gql.contains("data") && !gql["data"].is_null() &&
-                            gql["data"].contains("user") && gql["data"]["user"].is_object() &&
-                            !gql["data"]["user"].empty()) {
-                            body = gql.dump();
-                            std::cerr << "[+] graphql doc_id=" << docId << " succeeded" << std::endl;
-                            break;
-                        }
-                    } catch (...) {}
-                }
+            if (!infoResp.empty() && infoResp[0] == '{') {
+                try {
+                    json info = json::parse(infoResp);
+                    if (info.contains("user") && info["user"].is_object() &&
+                        !info["user"].empty()) {
+                        body = infoResp;
+                    }
+                } catch (...) {}
             }
         }
 
@@ -863,10 +887,9 @@ namespace IG {
             else
                 info.profilePicUrlHD = info.profilePicUrl;
 
-            // Validate we got real data (reject empty/null results)
-            if (info.userId.empty() && info.fullName.empty() &&
-                info.followerCount == 0 && info.mediaCount == 0) {
-                std::cerr << "[!] Profile data for '" << username << "' appears empty, rejecting." << std::endl;
+            // Validate we got at least a user ID
+            if (info.userId.empty() || info.userId == "0") {
+                std::cerr << "[!] Profile data for '" << username << "' has no user ID, rejecting." << std::endl;
                 return std::nullopt;
             }
 
