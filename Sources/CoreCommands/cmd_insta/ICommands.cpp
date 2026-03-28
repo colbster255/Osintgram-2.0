@@ -1168,7 +1168,7 @@ static int cmd_uactivity(const std::vector<std::string>& args) {
     std::vector<IG::UserEntry> nonMutuals;
 
     for (const auto& f : following) {
-        if (f.isPrivate) continue; // skip private accounts we can't access
+        // Try all accounts — private ones will just return empty feeds
         if (followerSet.count(f.username))
             accountsToScan.push_back(f);  // mutuals first
         else
@@ -1313,7 +1313,7 @@ static int cmd_umentions(const std::vector<std::string>& args) {
     std::vector<IG::UserEntry> accountsToScan;
     std::vector<IG::UserEntry> nonMutuals;
     for (const auto& f : following) {
-        if (f.isPrivate) continue;
+        // Try all accounts — private ones will just return empty feeds
         if (followerSet.count(f.username))
             accountsToScan.push_back(f);
         else
