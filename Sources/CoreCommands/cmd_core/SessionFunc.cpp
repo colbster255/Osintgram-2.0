@@ -52,10 +52,13 @@ static int doSetTarget(const std::vector<std::string>& args) {
                   << " | Followers: " << target.followerCount
                   << " | Following: " << target.followingCount << std::endl;
 
-        if (target.isPrivate) {
+        if (target.isPrivate && !target.isFollowing) {
             std::cout << std::endl;
-            std::cout << "[!] Warning: This account is private." << std::endl;
-            std::cout << "[!] You need to follow this account to access most data." << std::endl;
+            std::cout << "[!] Warning: This account is private and you don't follow them." << std::endl;
+            std::cout << "[!] Most data will be inaccessible." << std::endl;
+        } else if (target.isPrivate && target.isFollowing) {
+            std::cout << std::endl;
+            std::cout << "[*] This account is private but you follow them — full access available." << std::endl;
         }
 
         std::cout << std::endl;

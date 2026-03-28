@@ -43,6 +43,7 @@ namespace IG {
         bool isPrivate = false;
         bool isVerified = false;
         bool isBusiness = false;
+        bool isFollowing = false;  // whether logged-in user follows this target
     };
 
     struct MediaItem {

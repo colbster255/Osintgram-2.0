@@ -980,6 +980,11 @@ namespace IG {
             else
                 info.profilePicUrlHD = info.profilePicUrl;
 
+            // Friendship status (from /users/{id}/info/ response)
+            if (userJson.contains("friendship_status")) {
+                info.isFollowing = userJson["friendship_status"].value("following", false);
+            }
+
             // Validate we got at least a user ID
             if (info.userId.empty() || info.userId == "0") {
                 std::cerr << "[!] Profile data for '" << username << "' has no user ID, rejecting." << std::endl;
