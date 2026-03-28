@@ -1035,6 +1035,463 @@ static int cmd_fwercount(const std::vector<std::string>& args) {
 }
 
 // ============================================================================
+// Command: fans - engagement analysis: who interacts most with target's posts
+// ============================================================================
+static int cmd_fans(const std::vector<std::string>& args) {
+    if (!checkReady("fans")) return 1;
+
+    auto& mgr = IG::SessionManager::Instance();
+    auto target = mgr.GetTarget();
+
+    int maxPosts = 0;
+    if (!args.empty()) {
+        try { maxPosts = std::stoi(args[0]); } catch (...) {}
+    }
+
+    std::cout << "[*] Analyzing engagement on @" << target.username << "'s posts..." << std::endl;
+
+    auto feed = mgr.FetchUserFeed(target.userId, maxPosts);
+
+    if (feed.empty()) {
+        std::cout << "[*] No posts found" << std::endl;
+        return 0;
+    }
+
+    // Track per-user engagement: likes and comments
+    struct Engagement {
+        int likeCount = 0;
+        int commentCount = 0;
+        int score() const { return likeCount + commentCount * 2; } // comments weighted higher
+    };
+    std::map<std::string, Engagement> engagement;
+
+    int postsScanned = 0;
+    for (const auto& item : feed) {
+        postsScanned++;
+        std::cout << "\r[*] Scanning post " << postsScanned << "/" << feed.size() << "..." << std::flush;
+
+        // Collect likers
+        if (item.likeCount > 0) {
+            auto likers = mgr.FetchMediaLikers(item.mediaId);
+            for (const auto& liker : likers)
+                engagement[liker.username].likeCount++;
+        }
+
+        // Collect commenters
+        if (item.commentCount > 0) {
+            auto comments = mgr.FetchMediaComments(item.mediaId);
+            for (const auto& c : comments)
+                engagement[c.username].commentCount++;
+        }
+    }
+    std::cout << std::endl;
+
+    // Remove the target from their own engagement
+    engagement.erase(target.username);
+
+    if (engagement.empty()) {
+        std::cout << "[*] No engagement data found" << std::endl;
+        return 0;
+    }
+
+    // Sort by engagement score
+    std::vector<std::pair<std::string, Engagement>> sorted(engagement.begin(), engagement.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second.score() > b.second.score(); });
+
+    std::cout << "[+] Top fans of @" << target.username << " (across " << feed.size() << " posts):" << std::endl << std::endl;
+
+    std::cout << "  " << std::left << std::setw(25) << "Username"
+              << std::setw(10) << "Likes" << std::setw(12) << "Comments"
+              << "Score" << std::endl;
+    std::cout << "  " << std::string(60, '-') << std::endl;
+
+    for (const auto& [user, eng] : sorted) {
+        std::cout << "  @" << std::left << std::setw(24) << user
+                  << std::setw(10) << eng.likeCount
+                  << std::setw(12) << eng.commentCount
+                  << eng.score() << std::endl;
+    }
+
+    std::cout << std::endl;
+    std::cout << "[+] Total unique engagers: " << sorted.size() << std::endl;
+    std::cout << std::endl;
+    return 0;
+}
+
+// ============================================================================
+// Command: u.activity - scan related accounts' posts for target's comments/likes
+// ============================================================================
+static int cmd_uactivity(const std::vector<std::string>& args) {
+    if (!checkReady("u.activity")) return 1;
+
+    auto& mgr = IG::SessionManager::Instance();
+    auto target = mgr.GetTarget();
+
+    // How many of the target's connections to scan
+    int maxAccounts = 20;
+    int postsPerAccount = 10;
+    if (args.size() >= 1) {
+        try { maxAccounts = std::stoi(args[0]); } catch (...) {}
+    }
+    if (args.size() >= 2) {
+        try { postsPerAccount = std::stoi(args[1]); } catch (...) {}
+    }
+
+    std::cout << "[*] Building list of @" << target.username << "'s connections..." << std::endl;
+
+    // Get target's followers and following to find related accounts
+    auto following = mgr.FetchFollowing(target.userId);
+    auto followers = mgr.FetchFollowers(target.userId);
+
+    // Prioritize mutuals (most likely to have interactions)
+    std::set<std::string> followerSet;
+    for (const auto& f : followers) followerSet.insert(f.username);
+
+    std::vector<IG::UserEntry> accountsToScan;
+    std::vector<IG::UserEntry> nonMutuals;
+
+    for (const auto& f : following) {
+        if (f.isPrivate) continue; // skip private accounts we can't access
+        if (followerSet.count(f.username))
+            accountsToScan.push_back(f);  // mutuals first
+        else
+            nonMutuals.push_back(f);
+    }
+    // Append non-mutuals after
+    for (const auto& f : nonMutuals)
+        accountsToScan.push_back(f);
+
+    if (accountsToScan.empty()) {
+        std::cout << "[*] No accessible connections found to scan" << std::endl;
+        return 0;
+    }
+
+    int toScan = std::min(maxAccounts, static_cast<int>(accountsToScan.size()));
+    std::cout << "[*] Scanning " << toScan << " accounts for @" << target.username
+              << "'s activity (comments & likes)..." << std::endl << std::endl;
+
+    struct Activity {
+        std::string accountOwner;
+        std::string type; // "comment" or "like"
+        std::string text; // comment text (empty for likes)
+        std::string postCaption;
+        std::string date;
+    };
+    std::vector<Activity> found;
+
+    for (int i = 0; i < toScan; i++) {
+        const auto& account = accountsToScan[i];
+        std::cout << "\r[*] Scanning @" << account.username << " (" << (i + 1) << "/" << toScan << ")..." << std::flush;
+
+        auto feed = mgr.FetchUserFeed(account.userId, postsPerAccount);
+
+        for (const auto& item : feed) {
+            // Check comments for target's username
+            if (item.commentCount > 0) {
+                auto comments = mgr.FetchMediaComments(item.mediaId);
+                for (const auto& c : comments) {
+                    if (c.username == target.username) {
+                        Activity a;
+                        a.accountOwner = account.username;
+                        a.type = "comment";
+                        a.text = c.text;
+                        std::string cap = item.caption;
+                        if (cap.size() > 50) cap = cap.substr(0, 47) + "...";
+                        std::replace(cap.begin(), cap.end(), '\n', ' ');
+                        a.postCaption = cap;
+                        a.date = c.createdAt;
+                        found.push_back(a);
+                    }
+                }
+            }
+
+            // Check likers for target
+            if (item.likeCount > 0) {
+                auto likers = mgr.FetchMediaLikers(item.mediaId);
+                for (const auto& liker : likers) {
+                    if (liker.username == target.username) {
+                        Activity a;
+                        a.accountOwner = account.username;
+                        a.type = "like";
+                        std::string cap = item.caption;
+                        if (cap.size() > 50) cap = cap.substr(0, 47) + "...";
+                        std::replace(cap.begin(), cap.end(), '\n', ' ');
+                        a.postCaption = cap;
+                        a.date = item.takenAt;
+                        found.push_back(a);
+                    }
+                }
+            }
+        }
+    }
+
+    std::cout << std::endl << std::endl;
+
+    if (found.empty()) {
+        std::cout << "[*] No activity by @" << target.username << " found on scanned accounts" << std::endl;
+        std::cout << "[*] Try increasing accounts to scan: u.activity <num_accounts> <posts_per_account>" << std::endl;
+        return 0;
+    }
+
+    // Group by account
+    std::map<std::string, std::vector<const Activity*>> grouped;
+    for (const auto& a : found) grouped[a.accountOwner].push_back(&a);
+
+    std::cout << "[+] Found " << found.size() << " interaction(s) by @" << target.username
+              << " across " << grouped.size() << " account(s):" << std::endl << std::endl;
+
+    for (const auto& [owner, activities] : grouped) {
+        std::cout << "  @" << owner << " (" << activities.size() << " interaction"
+                  << (activities.size() > 1 ? "s" : "") << "):" << std::endl;
+        for (const auto* a : activities) {
+            if (a->type == "comment") {
+                std::cout << "    [Comment]";
+                if (!a->date.empty() && a->date != "0")
+                    std::cout << " " << formatTimestamp(a->date);
+                std::cout << ": \"" << a->text << "\"" << std::endl;
+            } else {
+                std::cout << "    [Liked] " << (a->postCaption.empty() ? "(no caption)" : a->postCaption) << std::endl;
+            }
+        }
+        std::cout << std::endl;
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// Command: u.mentions - find @target mentions in captions/comments of others
+// ============================================================================
+static int cmd_umentions(const std::vector<std::string>& args) {
+    if (!checkReady("u.mentions")) return 1;
+
+    auto& mgr = IG::SessionManager::Instance();
+    auto target = mgr.GetTarget();
+
+    int maxAccounts = 20;
+    int postsPerAccount = 10;
+    if (args.size() >= 1) {
+        try { maxAccounts = std::stoi(args[0]); } catch (...) {}
+    }
+    if (args.size() >= 2) {
+        try { postsPerAccount = std::stoi(args[1]); } catch (...) {}
+    }
+
+    std::string mention = "@" + target.username;
+
+    std::cout << "[*] Searching for mentions of " << mention << " across related accounts..." << std::endl;
+
+    // Also scan usertags feed for direct tags
+    std::cout << "[*] Checking tagged posts..." << std::endl;
+    auto taggedPosts = mgr.FetchUsertagsFeed(target.userId);
+
+    // Get connections to scan their captions/comments
+    auto following = mgr.FetchFollowing(target.userId);
+    auto followers = mgr.FetchFollowers(target.userId);
+
+    // Prioritize mutuals
+    std::set<std::string> followerSet;
+    for (const auto& f : followers) followerSet.insert(f.username);
+
+    std::vector<IG::UserEntry> accountsToScan;
+    std::vector<IG::UserEntry> nonMutuals;
+    for (const auto& f : following) {
+        if (f.isPrivate) continue;
+        if (followerSet.count(f.username))
+            accountsToScan.push_back(f);
+        else
+            nonMutuals.push_back(f);
+    }
+    for (const auto& f : nonMutuals)
+        accountsToScan.push_back(f);
+
+    int toScan = std::min(maxAccounts, static_cast<int>(accountsToScan.size()));
+
+    struct Mention {
+        std::string source;  // who mentioned
+        std::string context; // "caption", "comment", "photo tag"
+        std::string text;
+        std::string date;
+    };
+    std::vector<Mention> mentions;
+
+    // Add photo tag results
+    for (const auto& item : taggedPosts) {
+        Mention m;
+        m.source = item.taggedUsers.empty() ? "(unknown)" : item.taggedUsers[0];
+        m.context = "photo tag";
+        std::string cap = item.caption;
+        if (cap.size() > 60) cap = cap.substr(0, 57) + "...";
+        std::replace(cap.begin(), cap.end(), '\n', ' ');
+        m.text = cap.empty() ? "(no caption)" : cap;
+        m.date = item.takenAt;
+        mentions.push_back(m);
+    }
+
+    // Scan connections' posts for @mentions in captions and comments
+    std::cout << "[*] Scanning " << toScan << " accounts for " << mention << " in captions and comments..." << std::endl;
+
+    for (int i = 0; i < toScan; i++) {
+        const auto& account = accountsToScan[i];
+        std::cout << "\r[*] Scanning @" << account.username << " (" << (i + 1) << "/" << toScan << ")..." << std::flush;
+
+        auto feed = mgr.FetchUserFeed(account.userId, postsPerAccount);
+
+        for (const auto& item : feed) {
+            // Check caption for @mention
+            if (item.caption.find(mention) != std::string::npos) {
+                Mention m;
+                m.source = account.username;
+                m.context = "caption";
+                std::string cap = item.caption;
+                if (cap.size() > 80) cap = cap.substr(0, 77) + "...";
+                std::replace(cap.begin(), cap.end(), '\n', ' ');
+                m.text = cap;
+                m.date = item.takenAt;
+                mentions.push_back(m);
+            }
+
+            // Check comments for @mention
+            if (item.commentCount > 0) {
+                auto comments = mgr.FetchMediaComments(item.mediaId);
+                for (const auto& c : comments) {
+                    if (c.text.find(mention) != std::string::npos) {
+                        Mention m;
+                        m.source = c.username;
+                        m.context = "comment on @" + account.username + "'s post";
+                        m.text = c.text;
+                        m.date = c.createdAt;
+                        mentions.push_back(m);
+                    }
+                }
+            }
+        }
+    }
+
+    std::cout << std::endl << std::endl;
+
+    if (mentions.empty()) {
+        std::cout << "[*] No mentions of " << mention << " found" << std::endl;
+        return 0;
+    }
+
+    // Group by source
+    std::map<std::string, std::vector<const Mention*>> grouped;
+    for (const auto& m : mentions) grouped[m.source].push_back(&m);
+
+    // Sort groups by count
+    std::vector<std::pair<std::string, std::vector<const Mention*>>> sorted(grouped.begin(), grouped.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second.size() > b.second.size(); });
+
+    std::cout << "[+] Found " << mentions.size() << " mention(s) of " << mention
+              << " from " << grouped.size() << " source(s):" << std::endl << std::endl;
+
+    for (const auto& [source, mentionList] : sorted) {
+        std::cout << "  @" << source << " (" << mentionList.size() << " mention"
+                  << (mentionList.size() > 1 ? "s" : "") << "):" << std::endl;
+        for (const auto* m : mentionList) {
+            std::cout << "    [" << m->context << "]";
+            if (!m->date.empty() && m->date != "0")
+                std::cout << " " << formatTimestamp(m->date);
+            std::cout << std::endl;
+            std::cout << "      " << m->text << std::endl;
+        }
+        std::cout << std::endl;
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// Command: shared - shared connections between you and the target
+// ============================================================================
+static int cmd_shared(const std::vector<std::string>& args) {
+    if (!checkReady("shared")) return 1;
+
+    auto& mgr = IG::SessionManager::Instance();
+    auto target = mgr.GetTarget();
+    auto session = mgr.GetCurrentSession();
+
+    std::cout << "[*] Finding shared connections between you and @" << target.username << "..." << std::endl;
+
+    // Get your followers/following
+    std::cout << "[*] Fetching your connections..." << std::endl;
+    auto myFollowing = mgr.FetchFollowing(session.userId);
+    auto myFollowers = mgr.FetchFollowers(session.userId);
+
+    std::set<std::string> myFollowingSet, myFollowerSet;
+    for (const auto& f : myFollowing) myFollowingSet.insert(f.username);
+    for (const auto& f : myFollowers) myFollowerSet.insert(f.username);
+
+    // Get target's followers/following
+    std::cout << "[*] Fetching @" << target.username << "'s connections..." << std::endl;
+    auto targetFollowing = mgr.FetchFollowing(target.userId);
+    auto targetFollowers = mgr.FetchFollowers(target.userId);
+
+    std::set<std::string> targetFollowingSet, targetFollowerSet;
+    for (const auto& f : targetFollowing) targetFollowingSet.insert(f.username);
+    for (const auto& f : targetFollowers) targetFollowerSet.insert(f.username);
+
+    // Find shared: people you both follow
+    std::vector<std::string> bothFollow;
+    for (const auto& u : myFollowingSet) {
+        if (targetFollowingSet.count(u)) bothFollow.push_back(u);
+    }
+
+    // Find shared: people who follow you both
+    std::vector<std::string> followBoth;
+    for (const auto& u : myFollowerSet) {
+        if (targetFollowerSet.count(u)) followBoth.push_back(u);
+    }
+
+    // People target follows that follow you (potential bridges)
+    std::vector<std::string> targetFollowsYouFollow;
+    for (const auto& u : targetFollowingSet) {
+        if (myFollowerSet.count(u)) targetFollowsYouFollow.push_back(u);
+    }
+
+    std::cout << std::endl;
+    std::cout << "[+] Connection overlap with @" << target.username << ":" << std::endl << std::endl;
+
+    std::cout << "  You follow:            " << myFollowingSet.size() << std::endl;
+    std::cout << "  Target follows:        " << targetFollowingSet.size() << std::endl;
+    std::cout << "  Both of you follow:    " << bothFollow.size() << std::endl;
+    std::cout << "  Follow both of you:    " << followBoth.size() << std::endl;
+    std::cout << std::endl;
+
+    if (!bothFollow.empty()) {
+        std::sort(bothFollow.begin(), bothFollow.end());
+        std::cout << "[+] Accounts you BOTH follow (" << bothFollow.size() << "):" << std::endl;
+        for (const auto& u : bothFollow) {
+            std::cout << "  @" << u << std::endl;
+        }
+        std::cout << std::endl;
+    }
+
+    if (!followBoth.empty()) {
+        std::sort(followBoth.begin(), followBoth.end());
+        std::cout << "[+] Accounts that follow BOTH of you (" << followBoth.size() << "):" << std::endl;
+        for (const auto& u : followBoth) {
+            std::cout << "  @" << u << std::endl;
+        }
+        std::cout << std::endl;
+    }
+
+    if (!targetFollowsYouFollow.empty()) {
+        std::sort(targetFollowsYouFollow.begin(), targetFollowsYouFollow.end());
+        std::cout << "[+] Target follows, you're followed by (" << targetFollowsYouFollow.size() << "):" << std::endl;
+        for (const auto& u : targetFollowsYouFollow) {
+            std::cout << "  @" << u << std::endl;
+        }
+        std::cout << std::endl;
+    }
+
+    return 0;
+}
+
+// ============================================================================
 // Command dispatch map
 // ============================================================================
 using InstaFunc = int(*)(const std::vector<std::string>&);
@@ -1053,6 +1510,10 @@ static const std::map<std::string, InstaFunc> instaFuncMap = {
     {"tagged",        cmd_tagged},
     {"u.comments",    cmd_ucomments},
     {"u.tagged",      cmd_utagged},
+    {"u.activity",    cmd_uactivity},
+    {"u.mentions",    cmd_umentions},
+    {"fans",          cmd_fans},
+    {"shared",        cmd_shared},
     {"photos",        cmd_photos},
     {"pfp",           cmd_pfp},
     {"stories",       cmd_stories},
