@@ -1260,28 +1260,38 @@ namespace IG {
             std::string url = API_BASE + "/media/" + mediaId + "/comments/?can_support_threading=true&count=50";
             if (!minId.empty()) url += "&min_id=" + minId;
             ResponseData resp = MakeAuthenticatedRequest(url);
+            std::string body = GetResponseBody(resp);
+            std::cerr << "[DBG] FetchMediaComments(" << mediaId << ") HTTP " << resp.statusCode
+                      << ", body=" << body.size() << "B" << std::endl;
             if (resp.statusCode < 200 || resp.statusCode >= 300) break;
             try {
-                json data = json::parse(std::get<ByteData>(resp.body));
-                if (!data.contains("comments")) break;
+                json data = json::parse(body);
+                if (!data.contains("comments") || !data["comments"].is_array()) break;
                 for (const auto& c : data["comments"]) {
                     if (fetched >= maxCount) break;
                     CommentInfo ci;
-                    ci.commentId = std::to_string(c.value("pk", 0LL));
+                    ci.commentId = ExtractPk(c);
                     ci.text      = c.value("text",               "");
                     ci.likeCount = c.value("comment_like_count", 0);
-                    ci.createdAt = std::to_string(c.value("created_at", 0LL));
+                    if (c.contains("created_at")) {
+                        const auto& ca = c["created_at"];
+                        ci.createdAt = ca.is_string() ? ca.get<std::string>() : std::to_string(ca.get<long long>());
+                    }
                     if (c.contains("user")) {
                         ci.username = c["user"].value("username", "");
-                        ci.userId   = std::to_string(c["user"].value("pk", 0LL));
+                        ci.userId   = ExtractPk(c["user"]);
                     }
                     results.push_back(ci);
                     fetched++;
                 }
-                if (data.contains("next_min_id") && !data["next_min_id"].is_null())
-                    minId = data["next_min_id"].get<std::string>();
-                else break;
-            } catch (...) { break; }
+                if (data.contains("next_min_id") && !data["next_min_id"].is_null()) {
+                    const auto& v = data["next_min_id"];
+                    minId = v.is_string() ? v.get<std::string>() : std::to_string(v.get<long long>());
+                } else break;
+            } catch (const std::exception& ex) {
+                std::cerr << "[DBG] FetchMediaComments parse error: " << ex.what() << std::endl;
+                break;
+            }
         }
         return results;
     }
@@ -1289,23 +1299,28 @@ namespace IG {
     std::vector<UserEntry> SessionManager::FetchMediaLikers(const std::string& mediaId, int maxCount) {
         std::vector<UserEntry> results;
         ResponseData resp = MakeAuthenticatedRequest(API_BASE + "/media/" + mediaId + "/likers/");
+        std::string body = GetResponseBody(resp);
+        std::cerr << "[DBG] FetchMediaLikers(" << mediaId << ") HTTP " << resp.statusCode
+                  << ", body=" << body.size() << "B" << std::endl;
         if (resp.statusCode < 200 || resp.statusCode >= 300) return results;
         try {
-            json data = json::parse(std::get<ByteData>(resp.body));
+            json data = json::parse(body);
             if (!data.contains("users")) return results;
             int n = 0;
             for (const auto& u : data["users"]) {
                 if (n++ >= maxCount) break;
                 UserEntry e;
                 e.username      = u.value("username",       "");
-                e.userId        = std::to_string(u.value("pk", 0LL));
+                e.userId        = ExtractPk(u);
                 e.fullName      = u.value("full_name",       "");
                 e.profilePicUrl = u.value("profile_pic_url","");
                 e.isPrivate     = u.value("is_private",      false);
                 e.isVerified    = u.value("is_verified",     false);
                 results.push_back(e);
             }
-        } catch (...) {}
+        } catch (const std::exception& ex) {
+            std::cerr << "[DBG] FetchMediaLikers parse error: " << ex.what() << std::endl;
+        }
         return results;
     }
 
@@ -1382,6 +1397,72 @@ namespace IG {
                 if (!unique.count(u)) { UserEntry e; e.username = u; unique[u] = e; }
         for (auto& [_, e] : unique) tagged.push_back(e);
         return tagged;
+    }
+
+    std::vector<MediaItem> SessionManager::FetchUsertagsFeed(const std::string& userId, int maxCount) {
+        std::vector<MediaItem> items;
+        std::string nextMaxId;
+        int fetched = 0;
+        while (fetched < maxCount) {
+            std::string url = API_BASE + "/usertags/" + userId + "/feed/?count=20";
+            if (!nextMaxId.empty()) url += "&max_id=" + nextMaxId;
+            ResponseData resp = MakeAuthenticatedRequest(url);
+            std::string body = GetResponseBody(resp);
+            std::cerr << "[DBG] FetchUsertagsFeed HTTP " << resp.statusCode
+                      << ", body=" << body.size() << "B"
+                      << ", preview=" << body.substr(0, 120) << std::endl;
+            if (resp.statusCode < 200 || resp.statusCode >= 300) break;
+            try {
+                json data = json::parse(body);
+                if (!data.contains("items") || !data["items"].is_array()) {
+                    std::cerr << "[DBG] FetchUsertagsFeed: no 'items' array" << std::endl;
+                    break;
+                }
+                for (const auto& item : data["items"]) {
+                    if (fetched >= maxCount) break;
+                    MediaItem m;
+                    m.mediaId   = ExtractPk(item);
+                    m.shortcode = item.value("code", "");
+                    m.likeCount    = item.value("like_count",    0);
+                    m.commentCount = item.value("comment_count", 0);
+                    if (item.contains("taken_at")) {
+                        const auto& ta = item["taken_at"];
+                        m.takenAt = ta.is_string() ? ta.get<std::string>() : std::to_string(ta.get<long long>());
+                    }
+                    if (item.contains("caption") && !item["caption"].is_null())
+                        m.caption = item["caption"].value("text", "");
+                    int mt = item.value("media_type", 1);
+                    m.mediaType = (mt == 2) ? "video" : (mt == 8) ? "carousel" : "photo";
+                    if (item.contains("image_versions2") &&
+                        item["image_versions2"].contains("candidates") &&
+                        !item["image_versions2"]["candidates"].empty())
+                        m.imageUrl = item["image_versions2"]["candidates"][0].value("url","");
+                    if (item.contains("video_versions") && !item["video_versions"].empty())
+                        m.videoUrl = item["video_versions"][0].value("url","");
+                    if (item.contains("location") && !item["location"].is_null()) {
+                        m.location        = item["location"].value("name","");
+                        m.locationAddress = item["location"].value("address","");
+                    }
+                    // Get the post owner
+                    if (item.contains("user") && !item["user"].is_null()) {
+                        m.taggedUsers.push_back(item["user"].value("username", ""));
+                    }
+                    if (item.contains("usertags") && item["usertags"].contains("in"))
+                        for (const auto& tag : item["usertags"]["in"])
+                            if (tag.contains("user"))
+                                m.taggedUsers.push_back(tag["user"].value("username",""));
+                    items.push_back(m);
+                    fetched++;
+                }
+                if (!data.value("more_available", false)) break;
+                nextMaxId = ExtractNextMaxId(data);
+                if (nextMaxId.empty()) break;
+            } catch (const std::exception& ex) {
+                std::cerr << "[DBG] FetchUsertagsFeed parse error: " << ex.what() << std::endl;
+                break;
+            }
+        }
+        return items;
     }
 
     std::vector<UserEntry> SessionManager::SearchUsers(const std::string& query, int maxCount) {

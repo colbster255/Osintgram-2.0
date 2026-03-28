@@ -113,6 +113,7 @@ namespace IG {
         std::optional<std::string> FetchProfilePicHD(const std::string& userId);
         std::vector<MediaItem> FetchStories(const std::string& userId);
         std::vector<UserEntry> FetchTaggedUsers(const std::string& userId);
+        std::vector<MediaItem> FetchUsertagsFeed(const std::string& userId, int maxCount = 50);
         std::vector<UserEntry> SearchUsers(const std::string& query, int maxCount = 10);
 
         ~SessionManager();

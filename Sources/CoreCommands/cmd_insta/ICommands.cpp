@@ -511,7 +511,8 @@ static int cmd_tagged(const std::vector<std::string>& args) {
 }
 
 // ============================================================================
-// Command: u.comments - users who commented on target's posts
+// Command: u.comments - find where the target has commented + who comments
+//                       on the target's posts
 // ============================================================================
 static int cmd_ucomments(const std::vector<std::string>& args) {
     if (!checkReady("u.comments")) return 1;
@@ -519,16 +520,19 @@ static int cmd_ucomments(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    int maxPosts = 10;
+    int maxPosts = 20;
     if (!args.empty()) {
         try { maxPosts = std::stoi(args[0]); } catch (...) {}
     }
 
-    std::cout << "[*] Finding commenters on @" << target.username << "'s posts..." << std::endl;
+    // --- Part 1: Who comments on the target's posts ---
+    std::cout << "[*] Scanning @" << target.username << "'s posts for commenters..." << std::endl;
 
     auto feed = mgr.FetchUserFeed(target.userId, maxPosts);
 
     std::map<std::string, int> commenterCount;
+    // Also track where the target commented on their own posts
+    std::vector<std::pair<std::string, std::string>> targetSelfComments; // (post caption, comment text)
 
     for (const auto& item : feed) {
         if (item.commentCount == 0) continue;
@@ -536,32 +540,78 @@ static int cmd_ucomments(const std::vector<std::string>& args) {
         auto comments = mgr.FetchMediaComments(item.mediaId, 50);
         for (const auto& c : comments) {
             commenterCount[c.username]++;
+            if (c.username == target.username) {
+                std::string cap = item.caption.substr(0, 40);
+                std::replace(cap.begin(), cap.end(), '\n', ' ');
+                targetSelfComments.emplace_back(cap, c.text);
+            }
         }
     }
 
-    if (commenterCount.empty()) {
-        std::cout << "[*] No commenters found" << std::endl;
-        return 0;
+    if (!commenterCount.empty()) {
+        std::vector<std::pair<std::string, int>> sorted(commenterCount.begin(), commenterCount.end());
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+
+        std::cout << "[+] Found " << sorted.size() << " unique commenter(s) on target's posts:" << std::endl << std::endl;
+        for (const auto& [username, count] : sorted) {
+            std::cout << "  @" << username << " (" << count << " comment"
+                      << (count > 1 ? "s" : "") << ")" << std::endl;
+        }
+        std::cout << std::endl;
+    } else {
+        std::cout << "[*] No commenters found on target's posts" << std::endl << std::endl;
     }
 
-    // Sort by frequency
-    std::vector<std::pair<std::string, int>> sorted(commenterCount.begin(), commenterCount.end());
-    std::sort(sorted.begin(), sorted.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+    // --- Part 2: Scan posts the target is tagged in for the target's comments ---
+    std::cout << "[*] Scanning posts where @" << target.username << " is tagged for their comments..." << std::endl;
 
-    std::cout << "[+] Found " << sorted.size() << " unique commenter(s):" << std::endl << std::endl;
+    auto taggedPosts = mgr.FetchUsertagsFeed(target.userId, maxPosts);
 
-    for (const auto& [username, count] : sorted) {
-        std::cout << "  @" << username << " (" << count << " comment"
-                  << (count > 1 ? "s" : "") << ")" << std::endl;
+    std::vector<std::tuple<std::string, std::string, std::string>> targetTaggedComments; // (poster, comment text, date)
+    std::map<std::string, int> taggedPostOwners; // who posts photos that tag the target
+
+    for (const auto& item : taggedPosts) {
+        // First element of taggedUsers is the post owner (set by FetchUsertagsFeed)
+        std::string owner = item.taggedUsers.empty() ? "(unknown)" : item.taggedUsers[0];
+        taggedPostOwners[owner]++;
+
+        if (item.commentCount == 0) continue;
+
+        auto comments = mgr.FetchMediaComments(item.mediaId, 50);
+        for (const auto& c : comments) {
+            if (c.username == target.username) {
+                targetTaggedComments.emplace_back(owner, c.text, c.createdAt);
+            }
+        }
     }
 
-    std::cout << std::endl;
+    if (!taggedPosts.empty()) {
+        std::cout << "[+] Found " << taggedPosts.size() << " post(s) where @" << target.username
+                  << " is tagged" << std::endl << std::endl;
+    }
+
+    if (!targetTaggedComments.empty()) {
+        std::cout << "[+] @" << target.username << " commented on " << targetTaggedComments.size()
+                  << " tagged post(s):" << std::endl << std::endl;
+        for (size_t i = 0; i < targetTaggedComments.size(); i++) {
+            auto& [owner, text, date] = targetTaggedComments[i];
+            std::cout << "  " << (i + 1) << ". On @" << owner << "'s post";
+            if (!date.empty() && date != "0")
+                std::cout << " (" << formatTimestamp(date) << ")";
+            std::cout << ":" << std::endl;
+            std::cout << "     \"" << text << "\"" << std::endl;
+        }
+        std::cout << std::endl;
+    } else if (!taggedPosts.empty()) {
+        std::cout << "[*] @" << target.username << " hasn't commented on any tagged posts" << std::endl << std::endl;
+    }
+
     return 0;
 }
 
 // ============================================================================
-// Command: u.tagged - users who tagged the target in their posts
+// Command: u.tagged - find posts where others tagged the target (usertags feed)
 // ============================================================================
 static int cmd_utagged(const std::vector<std::string>& args) {
     if (!checkReady("u.tagged")) return 1;
@@ -569,35 +619,52 @@ static int cmd_utagged(const std::vector<std::string>& args) {
     auto& mgr = IG::SessionManager::Instance();
     auto target = mgr.GetTarget();
 
-    std::cout << "[*] Finding users who tagged @" << target.username << "..." << std::endl;
+    int maxPosts = 30;
+    if (!args.empty()) {
+        try { maxPosts = std::stoi(args[0]); } catch (...) {}
+    }
 
-    // This uses the usertags_feed endpoint
-    std::string url = "https://i.instagram.com/api/v1/usertags/" + target.userId + "/feed/";
-    auto resp = mgr.FetchUserFeed(target.userId, 30);
+    std::cout << "[*] Finding posts where @" << target.username << " is tagged..." << std::endl;
 
-    // For u.tagged, we check for reverse tagging. Since the API for this is different,
-    // we'll note that this is a simplified version
-    std::cout << "[*] Note: This command shows users who tagged the target in THEIR posts." << std::endl;
-    std::cout << "[*] Full implementation requires usertags API endpoint." << std::endl;
+    auto taggedPosts = mgr.FetchUsertagsFeed(target.userId, maxPosts);
+
+    if (taggedPosts.empty()) {
+        std::cout << "[*] No tagged posts found (account may be private or no tags exist)" << std::endl;
+        return 0;
+    }
+
+    // Collect unique users who tagged the target + post details
+    std::map<std::string, std::vector<size_t>> userPosts; // username -> post indices
+
+    for (size_t i = 0; i < taggedPosts.size(); i++) {
+        // First taggedUser is the post owner (set by FetchUsertagsFeed)
+        std::string owner = taggedPosts[i].taggedUsers.empty() ? "(unknown)" : taggedPosts[i].taggedUsers[0];
+        userPosts[owner].push_back(i);
+    }
+
+    std::cout << "[+] Found " << taggedPosts.size() << " post(s) from " << userPosts.size()
+              << " user(s) tagging @" << target.username << ":" << std::endl << std::endl;
+
+    // Sort users by number of times they tagged the target
+    std::vector<std::pair<std::string, std::vector<size_t>>> sorted(userPosts.begin(), userPosts.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second.size() > b.second.size(); });
+
+    for (const auto& [owner, indices] : sorted) {
+        std::cout << "  @" << owner << " (" << indices.size() << " post"
+                  << (indices.size() > 1 ? "s" : "") << "):" << std::endl;
+        for (size_t idx : indices) {
+            const auto& item = taggedPosts[idx];
+            std::string caption = item.caption;
+            if (caption.size() > 60) caption = caption.substr(0, 57) + "...";
+            std::replace(caption.begin(), caption.end(), '\n', ' ');
+            std::cout << "    - " << formatTimestamp(item.takenAt) << " | "
+                      << item.mediaType << " | "
+                      << (caption.empty() ? "(no caption)" : caption) << std::endl;
+        }
+    }
+
     std::cout << std::endl;
-
-    // Show what we can from the target's own feed regarding who they interact with
-    std::set<std::string> mentionedUsers;
-    for (const auto& item : resp) {
-        for (const auto& u : item.taggedUsers) {
-            mentionedUsers.insert(u);
-        }
-    }
-
-    if (!mentionedUsers.empty()) {
-        std::cout << "[+] Users found in target's post tags:" << std::endl;
-        int i = 1;
-        for (const auto& u : mentionedUsers) {
-            std::cout << "  " << i++ << ". @" << u << std::endl;
-        }
-        std::cout << std::endl;
-    }
-
     return 0;
 }
 
